@@ -31,7 +31,7 @@
 Нужны Windows и Python 3.10+.
 
 ```bat
-git clone https://github.com/<твой-ник>/zapret-gui.git
+git clone https://github.com/Arxn0n/zapret-gui.git
 cd zapret-gui
 pip install -r requirements.txt
 python zapret_gui.py
