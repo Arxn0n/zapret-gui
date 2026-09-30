@@ -1,0 +1,5 @@
+customtkinter>=5.2
+psutil>=5.9
+# необязательно, для иконки в трее:
+pystray>=0.19
+Pillow>=10.0
