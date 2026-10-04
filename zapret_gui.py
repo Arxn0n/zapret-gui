@@ -24,11 +24,11 @@ from tkinter import filedialog, messagebox
 import customtkinter as ctk
 
 from zapret_core import (
-    APP_NAME, CREATE_NO_WINDOW, DEFAULT_CHECKS, LOG_PATH, REPO, START_WAIT,
+    APP_NAME, CREATE_NO_WINDOW, DEFAULT_CHECKS, DISCORD_CHECKS, LOG_PATH, REPO,
     Cancelled, Config, delete_version, detect_version, discover_builds,
     fetch_latest_release, find_bats, find_file, format_checks, install_release,
     installed_versions, is_admin, is_autostart_enabled, is_installed, is_managed,
-    launch_bat, norm_path, parse_checks_text, relaunch_as_admin, scan_strategies,
+    launch_bat, norm_path, order_bats, parse_checks_text, relaunch_as_admin, scan_strategies,
     set_autostart, stop_zapret, version_key, wait_for_winws, winws_processes,
 )
 
@@ -243,6 +243,13 @@ class StrategyRow(ctk.CTkFrame):
         self.chip.pack(side="right", padx=(6, 12))
         for w in (self, self.name_lbl, self.chip):
             w.bind("<Button-1>", lambda e, b=bat: on_click(b))
+            try:
+                w.configure(cursor="hand2")
+            except Exception:
+                pass
+
+    def set_active(self, flag: bool):
+        self.name_lbl.configure(text=("▶  " if flag else "") + self.bat.name)
 
     def set_selected(self, flag: bool):
         self.configure(fg_color=ROW_SEL if flag else ROW,
@@ -308,6 +315,7 @@ class App(ctk.CTk):
         self._spin_i = 0
 
         self.scanning = False
+        self._from_click = False
         self.cancel_scan = threading.Event()
         self._scan_done = 0
         self._scan_total = 1
@@ -344,6 +352,7 @@ class App(ctk.CTk):
         threading.Thread(target=self._poller, daemon=True).start()
         if self.cfg["check_updates"]:
             self.check_updates(manual=False)
+        self.after(6 * 3600 * 1000, self._periodic_update_check)
         if not self.cfg["discovered"]:
             self.after(600, lambda: self.find_builds(auto=True))
         if self.cfg["autostart_strategy"] and self.selected:
@@ -463,6 +472,11 @@ class App(ctk.CTk):
                                    corner_radius=10, wraplength=560, justify="left",
                                    anchor="w", font=(FONT, 13))
         self._banner_shown = False
+        self.banner.bind("<Button-1>", lambda e: self.tabs.set(TAB_INSTALL))
+        try:
+            self.banner.configure(cursor="hand2")
+        except Exception:
+            pass
 
         pick = card(tab)
         pick.pack(fill="x", pady=(0, 10))
@@ -610,6 +624,8 @@ class App(ctk.CTk):
         if is_autostart_enabled():
             self.sw_autostart.select()
         self.sw_autostart.pack(anchor="w", padx=16, pady=7)
+        self._switch(beh, "Запускать стратегию по клику в списке", "click_to_start")
+        self._switch(beh, "Автоподбор: сначала прошлая и ранее рабочие", "smart_order")
         self._switch(beh, "Запускать последнюю стратегию при старте GUI", "autostart_strategy")
         self._switch(beh, "Проверять обновления при старте", "check_updates")
         self._switch(beh, "Останавливать zapret при выходе из GUI", "stop_on_exit")
@@ -649,8 +665,31 @@ class App(ctk.CTk):
         button(r, "Сохранить", self.save_checks, kind="primary", width=110
                ).pack(side="left", padx=4)
         button(r, "По умолчанию", self.reset_checks, width=120).pack(side="left", padx=4)
+        button(r, "+ Discord", self.add_discord_checks, width=90).pack(side="left", padx=4)
         self.checks_lbl = label(r, "", muted=True, size=12)
         self.checks_lbl.pack(side="left", padx=8)
+
+        tm = card(page)
+        tm.pack(fill="x", pady=(0, 10))
+        title(tm, "Тайминги автоподбора (секунды)").pack(fill="x", padx=16, pady=(14, 2))
+        label(tm, ("Если на медленном ПК стратегии ложно помечаются «не запустился» "
+                   "или «✘», увеличь значения."),
+              muted=True, size=12, anchor="w", justify="left", wraplength=540
+              ).pack(fill="x", padx=16)
+        tr = ctk.CTkFrame(tm, fg_color="transparent")
+        tr.pack(fill="x", padx=12, pady=(8, 14))
+        label(tr, "Ожидание winws.exe").pack(side="left", padx=(4, 6))
+        self.start_wait_e = ctk.CTkEntry(tr, width=60, font=(FONT, 13))
+        self.start_wait_e.insert(0, str(self.cfg["start_wait"]))
+        self.start_wait_e.pack(side="left")
+        label(tr, "Таймаут проверки").pack(side="left", padx=(16, 6))
+        self.check_to_e = ctk.CTkEntry(tr, width=60, font=(FONT, 13))
+        self.check_to_e.insert(0, str(self.cfg["check_timeout"]))
+        self.check_to_e.pack(side="left")
+        button(tr, "Сохранить", self.save_timings, kind="primary", width=100
+               ).pack(side="left", padx=12)
+        self.timing_lbl = label(tr, "", muted=True, size=12)
+        self.timing_lbl.pack(side="left")
 
     def _sync_tray_ui(self):
         """Показывает переключатель трея или предлагает доустановить зависимости."""
@@ -750,6 +789,7 @@ class App(ctk.CTk):
             self._pulse()
         elif kind == "off":
             self.dot.configure(text_color=MUTED)
+        self._sync_rows()
 
     def _pulse(self):
         kind = self._status_kind
@@ -821,7 +861,7 @@ class App(ctk.CTk):
         stop_zapret()
         time.sleep(0.2)
         launch_bat(bat)
-        ok = wait_for_winws(START_WAIT)
+        ok = wait_for_winws(self._f("start_wait", 4.0))
         if ok:
             self.log(f"Запущено: {bat.name}")
         else:
@@ -831,6 +871,12 @@ class App(ctk.CTk):
 
     def _after_start(self, ok: bool):
         self.launching = False
+        if self._from_click:
+            self._from_click = False
+            name = self.active_name or (self.selected.name if self.selected else "")
+            self.scan_lbl.configure(
+                text=(f"Запущено: {name}" if ok else
+                      "Не запустилось — проверь права администратора и антивирус"))
         if not ok:
             self.active_name = None
         self._render_status()
@@ -949,8 +995,16 @@ class App(ctk.CTk):
         self._sync_rows()
 
     def _sync_rows(self):
+        live = self.active_name if (self.running or self.launching) else None
         for name, row in self.rows.items():
             row.set_selected(bool(self.selected) and name == self.selected.name)
+            row.set_active(bool(live) and name == live)
+
+    def _f(self, key: str, default: float) -> float:
+        try:
+            return max(0.5, float(self.cfg[key]))
+        except (TypeError, ValueError):
+            return default
 
     def _select(self, bat: Path | None, save: bool = True):
         self.selected = bat
@@ -960,8 +1014,20 @@ class App(ctk.CTk):
             self.cfg["last_bat"] = str(bat)
 
     def _on_row_click(self, bat: Path):
-        if not self.scanning:
-            self._select(bat)
+        if self.scanning:
+            return
+        self._select(bat)
+        if not self.cfg["click_to_start"]:
+            return
+        if self.launching:
+            self.scan_lbl.configure(text="Подожди, идёт запуск/остановка…")
+            return
+        if self.running and self.active_name == bat.name:
+            self.scan_lbl.configure(text=f"{bat.name} уже работает")
+            return
+        self._from_click = True
+        self.scan_lbl.configure(text=f"Запускаю {bat.name}…")
+        self.start()
 
     def _on_menu(self, name: str):
         bat = next((b for b in self.bats if b.name == name), None)
@@ -1022,21 +1088,26 @@ class App(ctk.CTk):
         if not checks:
             self.scan_lbl.configure(text="Список проверок пуст (вкладка «Настройки»)")
             return
+        order = list(self.bats)
+        if self.cfg["smart_order"]:
+            prev = self.cfg["scan_results"].get(str(self.folder), {})
+            last = Path(self.cfg["last_bat"]).name if self.cfg["last_bat"] else ""
+            order = order_bats(order, last, prev)
         self.scanning = True
         self.cancel_scan.clear()
         self.scan_btn.configure(text="✖  Отмена")
         self.results.clear()
         for bat in self.bats:
             self._mark(bat, "")
-        self._scan_done, self._scan_total = 0, len(self.bats)
+        self._scan_done, self._scan_total = 0, len(order)
         self.scan_current = ""
         self.scan_bar.reset()
         self._render_status()
         self._refresh_power()
-        self.log(f"Автоподбор: {len(self.bats)} стратегий")
+        self.log(f"Автоподбор: {len(order)} стратегий")
         threading.Thread(
             target=self._scan_worker,
-            args=(list(self.bats), [list(c) for c in checks], bool(self.stop_first.get())),
+            args=(order, [list(c) for c in checks], bool(self.stop_first.get())),
             daemon=True).start()
 
     def _scan_worker(self, bats, checks, stop_first):
@@ -1045,7 +1116,9 @@ class App(ctk.CTk):
                 bats, checks, stop_first=stop_first, cancel=self.cancel_scan,
                 progress=lambda i, t, b: self.ui(self._scan_progress, i, t, b),
                 result=lambda b, text, ok, el: self.ui(self._scan_result, b, text),
-                say=lambda t: self.ui(self._scan_say, t))
+                say=lambda t: self.ui(self._scan_say, t),
+                start_wait=self._f("start_wait", 4.0),
+                check_timeout=self._f("check_timeout", 4.0))
         except Exception as e:
             self.log(f"Ошибка автоподбора: {e!r}")
             res = None
@@ -1145,6 +1218,29 @@ class App(ctk.CTk):
             self.install_btn.configure(text=f"Скачать и установить {rel.tag}", state="normal")
         self._refresh_banner()
         self.log(f"Последняя версия на GitHub: {rel.tag}")
+        self._notify_update(rel)
+
+    def _notify_update(self, rel):
+        """Один раз на версию: запись в лог и (если есть трей) всплывающее уведомление."""
+        if not self.folder:
+            return
+        cur = detect_version(self.folder)
+        if cur is not None and version_key(rel.tag) <= version_key(cur):
+            return
+        if self.cfg["notified_tag"] == rel.tag:
+            return
+        self.cfg["notified_tag"] = rel.tag
+        self.log(f"Вышла новая версия zapret: {rel.tag} (вкладка «Установка»)")
+        if self.tray:
+            try:
+                self.tray.notify(f"Доступна версия {rel.tag}", "Zapret GUI")
+            except Exception:
+                pass
+
+    def _periodic_update_check(self):
+        if self.cfg["check_updates"] and not self.scanning:
+            self.check_updates(manual=False)
+        self.after(6 * 3600 * 1000, self._periodic_update_check)
 
     def _on_update_error(self, err: Exception, manual: bool):
         self.checking = False
@@ -1370,6 +1466,33 @@ class App(ctk.CTk):
             return
         self.cfg["checks"] = checks
         self.checks_lbl.configure(text=f"Сохранено ({len(checks)})", text_color=OK_TXT)
+
+    def add_discord_checks(self):
+        text = self.checks_box.get("1.0", "end")
+        have = {u for _, u, _ in parse_checks_text(text)[0]}
+        added = 0
+        for n, u, b in DISCORD_CHECKS:
+            if u not in have:
+                self.checks_box.insert("end", ("" if text.endswith("\n\n") else "\n")
+                                       + f"{n} | {u} | {b}")
+                text = self.checks_box.get("1.0", "end")
+                added += 1
+        if added:
+            self.save_checks()
+        else:
+            self.checks_lbl.configure(text="Discord уже в списке", text_color=MUTED)
+
+    def save_timings(self):
+        try:
+            sw = float(self.start_wait_e.get().replace(",", "."))
+            ct = float(self.check_to_e.get().replace(",", "."))
+            if not (1 <= sw <= 60 and 1 <= ct <= 60):
+                raise ValueError
+        except ValueError:
+            self.timing_lbl.configure(text="Нужны числа от 1 до 60", text_color=WARN_TXT)
+            return
+        self.cfg["start_wait"], self.cfg["check_timeout"] = sw, ct
+        self.timing_lbl.configure(text="Сохранено", text_color=OK_TXT)
 
     def reset_checks(self):
         self.checks_box.delete("1.0", "end")
