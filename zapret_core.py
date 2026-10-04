@@ -52,6 +52,10 @@ DEFAULT_CHECKS = [
     ["картинка", "https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg", 8_000],
     ["видео-CDN", "https://redirector.googlevideo.com/", 1],
 ]
+DISCORD_CHECKS = [
+    ["Discord", "https://discord.com/", 1],
+    ["Discord gateway", "https://gateway.discord.gg/", 1],
+]
 CHECK_TIMEOUT = 4.0     # максимум на одну стратегию (проверки идут параллельно)
 START_WAIT = 4.0        # сколько ждать появления winws.exe после запуска батника
 SETTLE = 0.8            # пауза после старта, чтобы фильтр успел подняться
@@ -69,6 +73,11 @@ DEFAULT_CONFIG = {
     "scan_results": {},              # {путь_к_папке: {имя_батника: "✔ 2.1с"}}
     "known_folders": [],             # сборки zapret, скачанные/найденные вне GUI
     "discovered": False,             # поиск сборок на компьютере уже выполнялся
+    "click_to_start": True,          # клик по стратегии в списке сразу запускает её
+    "smart_order": True,             # автоподбор: сначала прошлая и ранее рабочие стратегии
+    "start_wait": START_WAIT,        # сколько ждать появления winws.exe (сек)
+    "check_timeout": CHECK_TIMEOUT,  # таймаут проверок на одну стратегию (сек)
+    "notified_tag": "",              # версию какого релиза мы уже показали уведомлением
 }
 
 
@@ -206,20 +215,74 @@ def winws_processes() -> list[psutil.Process]:
 
 
 def stop_zapret():
-    for p in winws_processes():
+    """Убивает winws.exe (до 3 попыток, ждёт реального завершения), затем
+    останавливает драйвер WinDivert, который иногда остаётся висеть."""
+    for _ in range(3):
+        procs = winws_processes()
+        if not procs:
+            break
+        for p in procs:
+            try:
+                p.kill()
+            except Exception:
+                pass
         try:
-            p.kill()
+            psutil.wait_procs(procs, timeout=1.5)
         except Exception:
             pass
     if sys.platform == "win32":
-        # иногда драйвер остаётся висеть — пробуем остановить
         for svc in ("WinDivert", "WinDivert14"):
             subprocess.run(["sc", "stop", svc], capture_output=True,
                            creationflags=CREATE_NO_WINDOW)
 
 
-def launch_bat(bat: Path):
-    subprocess.Popen(["cmd.exe", "/c", str(bat)], cwd=str(Path(bat).parent),
+TMP_BAT_PREFIX = "service_tmp_"   # начинается с "service" -> скрыт из списка стратегий
+_UPDATE_CALL_RE = re.compile(
+    rb"(?im)^[ \t]*(?:call[ \t]+)?(?:\"[^\"\r\n]*service\.bat\"|[^\s\"]*service\.bat)[ \t]+check_updates\b[^\r\n]*")
+
+
+def _cleanup_tmp_bats(folder: Path):
+    for f in Path(folder).glob(TMP_BAT_PREFIX + "*.bat"):
+        try:
+            f.unlink()
+        except OSError:
+            pass
+
+
+def _make_quiet_bat(bat: Path) -> Optional[Path]:
+    """Копия батника без вызова `service.bat check_updates` (он открывает
+    страницу релиза на GitHub при каждом запуске). None — если вызова нет."""
+    try:
+        data = Path(bat).read_bytes()
+        patched, n = _UPDATE_CALL_RE.subn(b"rem update check disabled by GUI", data)
+        if n == 0:
+            return None
+        tmp = Path(bat).with_name(TMP_BAT_PREFIX + Path(bat).name)
+        tmp.write_bytes(patched)
+        return tmp
+    except OSError:
+        return None
+
+
+def _disable_update_flag(folder: Path):
+    """Сборки Flowseal проверяют обновления, только если есть этот флаг-файл."""
+    for d in (folder, folder.parent):
+        flag = d / "utils" / "check_updates.enabled"
+        try:
+            if flag.is_file():
+                flag.unlink()
+        except OSError:
+            pass
+
+
+def launch_bat(bat: Path, quiet_updates: bool = True):
+    bat = Path(bat)
+    run = bat
+    if quiet_updates:
+        _disable_update_flag(bat.parent)
+        _cleanup_tmp_bats(bat.parent)
+        run = _make_quiet_bat(bat) or bat
+    subprocess.Popen(["cmd.exe", "/c", str(run)], cwd=str(bat.parent),
                      creationflags=CREATE_NO_WINDOW)
 
 
@@ -407,8 +470,29 @@ class ScanResult:
     last: Optional[Path]              # последняя запущенная стратегия
 
 
+def order_bats(bats, last_name: str = "", prev_results: dict = None) -> list:
+    """Порядок проверки: сначала последняя использованная, затем ранее рабочие
+    (от быстрой к медленной), затем остальные по алфавиту."""
+    prev_results = prev_results or {}
+
+    def ok_time(b):
+        m = re.match(r"\s*✔\s*([\d.]+)", prev_results.get(b.name, ""))
+        return float(m.group(1)) if m else None
+
+    def key(b):
+        if last_name and b.name == last_name:
+            return (0, 0.0, b.name.lower())
+        t = ok_time(b)
+        if t is not None:
+            return (1, t, b.name.lower())
+        return (2, 0.0, b.name.lower())
+    return sorted(bats, key=key)
+
+
 def scan_strategies(bats, checks, *, stop_first: bool, cancel: threading.Event,
-                    progress: Callable, result: Callable, say: Callable) -> ScanResult:
+                    progress: Callable, result: Callable, say: Callable,
+                    start_wait: float = START_WAIT,
+                    check_timeout: float = CHECK_TIMEOUT) -> ScanResult:
     """Перебирает стратегии по очереди.
     progress(i, total, bat); result(bat, текст, ok|None, секунды); say(текст)."""
     total = len(bats)
@@ -418,7 +502,7 @@ def scan_strategies(bats, checks, *, stop_first: bool, cancel: threading.Event,
     stop_zapret()
     time.sleep(0.5)
     say("Контрольная проверка без zapret...")
-    base, _ = run_checks(checks)
+    base, _ = run_checks(checks, check_timeout)
     if all(base.values()):
         return ScanResult("baseline_ok", [], None)
 
@@ -433,12 +517,12 @@ def scan_strategies(bats, checks, *, stop_first: bool, cancel: threading.Event,
         launch_bat(bat)
         last = bat
 
-        if not wait_for_winws(START_WAIT):
+        if not wait_for_winws(start_wait):
             result(bat, "⚠ не запустился", False, 0.0)
             continue
         time.sleep(SETTLE)
 
-        res, elapsed = run_checks(checks)
+        res, elapsed = run_checks(checks, check_timeout)
         failed = [n for n, ok in res.items() if not ok]
         if not failed:
             winners.append((elapsed, bat))
@@ -447,6 +531,10 @@ def scan_strategies(bats, checks, *, stop_first: bool, cancel: threading.Event,
                 break
         else:
             result(bat, "✘ " + ", ".join(failed), False, elapsed)
+
+    if last:
+        time.sleep(0.5)
+        _cleanup_tmp_bats(Path(last).parent)
 
     if cancel.is_set():
         status = "cancelled"
